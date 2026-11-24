@@ -1,0 +1,28 @@
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Bytecode & Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Local market data & offline caches
+data_cache/
+
+# Logs & runtime outputs
+logs/
+*.log
+
+# Generated reports & equity charts
+reports/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini
