@@ -15,15 +15,17 @@ def fetch_angel_historical_data(
     interval: str = "FIVE_MINUTE",
     symbol_token: str = "99926000",
     exchange: str = "NSE",
-    force_refresh: bool = False
+    force_refresh: bool = False,
+    broker: Optional[AngelOneBroker] = None
 ) -> pd.DataFrame:
     """
     Fetches real historical candles directly from Angel One SmartAPI.
-    Caches to parquet to avoid redundant API calls.
+    Caches to CSV to avoid redundant API calls.
     """
     os.makedirs(CACHE_DIR, exist_ok=True)
     cache_file = os.path.join(CACHE_DIR, f"nifty_angel_{interval}_{days}d.csv")
 
+    cached_df = None
     if not force_refresh and os.path.exists(cache_file):
         try:
             df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
@@ -34,15 +36,26 @@ def fetch_angel_historical_data(
                     df.index = df.index.tz_localize("Asia/Kolkata")
                 else:
                     df.index = df.index.tz_convert("Asia/Kolkata")
-                print(f"[AngelData] Loaded {len(df):,} candles from local Angel One cache.")
-                return df
+                cached_df = df
+                # Auto-refresh short-window live baseline caches if older than 1 day
+                if days <= 10 and df.index[-1].date() < (datetime.now() - timedelta(days=1)).date():
+                    print(f"[AngelData] Local cache is stale (last bar: {df.index[-1]}). Refreshing from Angel One...")
+                else:
+                    print(f"[AngelData] Loaded {len(df):,} candles from local Angel One cache.")
+                    return df
         except Exception:
             pass
 
-    print(f"[AngelData] Connecting to Angel One SmartAPI to download {days} days of historical 5m candles...")
-    broker = AngelOneBroker()
-    if not broker.connect():
-        raise ConnectionError("Failed to authenticate with Angel One SmartAPI.")
+    if broker is None or not broker.is_connected:
+        print(f"[AngelData] Connecting to Angel One SmartAPI to download {days} days of historical 5m candles...")
+        broker = AngelOneBroker()
+        if not broker.connect():
+            if cached_df is not None:
+                print("[AngelData] Refresh failed; using existing local cache as baseline.")
+                return cached_df
+            raise ConnectionError("Failed to authenticate with Angel One SmartAPI.")
+    else:
+        print(f"[AngelData] Using active Angel One session to download {days} days of historical 5m candles...")
 
     all_candles = []
     end_date = datetime.now()

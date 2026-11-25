@@ -63,13 +63,39 @@ class LiveMarketRunner:
             df = generate_realistic_nifty_intraday(days=45)
             self.classifier.train(df)
 
-        self.active_trade = None
+        self.active_trades: Dict[str, Dict[str, Any]] = {}
         self.last_candle_time = None
+        self.startup_synced = False
         self.cached_candles = None
         self.last_fetch_ts = 0.0
+        self.today_synced = False
         from core.trade_journal import TradeJournal
         self.journal = TradeJournal()
         self.eod_report_sent = False
+
+        # Restore any OPEN trades from today's journal to prevent duplicate contract signals across restarts
+        for t in self.journal.trades:
+            if t.get("status") == "OPEN":
+                contract = t.get("contract")
+                if contract:
+                    self.active_trades[contract] = {
+                        "journal_id": t["id"],
+                        "contract": contract,
+                        "option_type": t["option_type"],
+                        "strike": t["strike"],
+                        "lots": t["lots"],
+                        "quantity": t["quantity"],
+                        "entry_spot": t["spot_entry"],
+                        "entry_premium": t["entry_premium"],
+                        "spot_sl": t["spot_sl"],
+                        "spot_target": t["spot_target"],
+                        "spot_target_2": t["spot_target_2"],
+                        "sl_premium": t["sl_premium"],
+                        "target_premium": t["target_premium"],
+                        "target_premium_2": t["target_premium_2"],
+                        "sl_trailed": t.get("target1_hit", False),
+                        "entry_time": t.get("entry_time", "")
+                    }
 
     def is_market_open(self) -> bool:
         """Checks if current time is within NSE market hours (09:15 - 15:30 IST)."""
@@ -103,9 +129,10 @@ class LiveMarketRunner:
         # 3. A new 5-minute bar has completed (now >= last_candle_time + 5 mins + 5 sec)
         if self.cached_candles is not None:
             time_since_fetch = now_ts - self.last_fetch_ts
-            if time_since_fetch < 60:
+            min_cooldown = 60 if self.today_synced else 5
+            if time_since_fetch < min_cooldown:
                 return self.cached_candles
-            if self.last_candle_time is not None:
+            if self.today_synced and self.last_candle_time is not None:
                 try:
                     last_dt = pd.to_datetime(self.last_candle_time)
                     if hasattr(last_dt, 'tz_localize') and last_dt.tzinfo is None:
@@ -125,13 +152,26 @@ class LiveMarketRunner:
                 if self.cached_candles is None:
                     console.print("[cyan]Loading baseline historical market candles from Angel One cache...[/cyan]")
                     from data.angel_fetcher import fetch_angel_historical_data
-                    self.cached_candles = fetch_angel_historical_data(days=5, interval="FIVE_MINUTE", force_refresh=False)
+                    self.cached_candles = fetch_angel_historical_data(
+                        days=5,
+                        interval="FIVE_MINUTE",
+                        force_refresh=False,
+                        broker=self.broker
+                    )
                     if not isinstance(self.cached_candles.index, pd.DatetimeIndex):
                         self.cached_candles.index = pd.to_datetime(self.cached_candles.index)
                     if self.cached_candles.index.tz is None:
                         self.cached_candles.index = self.cached_candles.index.tz_localize("Asia/Kolkata")
                     else:
                         self.cached_candles.index = self.cached_candles.index.tz_convert("Asia/Kolkata")
+                    # If baseline refresh already pulled the current bar (< 5m old), skip redundant startup API hit
+                    last_bar_ts = self.cached_candles.index[-1].timestamp()
+                    if (now_ts - last_bar_ts) < 300:
+                        self.today_synced = True
+                        self.last_fetch_ts = time.time()
+                        return self.cached_candles
+                    # Small pause after baseline fetch before live intraday bar query to avoid rate limits
+                    time.sleep(0.8)
 
                 # Step 2: Fetch only today's completed 5-min candles using existing broker session
                 params = {
@@ -141,8 +181,18 @@ class LiveMarketRunner:
                     "fromdate": f"{today_str} 09:15",
                     "todate": f"{today_str} 15:30"
                 }
-                res = self.broker.smart_api.getCandleData(params)
-                self.last_fetch_ts = now_ts
+                res = None
+                for attempt in range(2):
+                    try:
+                        res = self.broker.smart_api.getCandleData(params)
+                        break
+                    except Exception as api_err:
+                        if attempt == 0 and "access rate" in str(api_err).lower():
+                            time.sleep(2.0)
+                            continue
+                        raise
+
+                self.last_fetch_ts = time.time()
                 if res and res.get("status") and res.get("data"):
                     today_data = res["data"]
                     df_today = pd.DataFrame(today_data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume"])
@@ -160,12 +210,14 @@ class LiveMarketRunner:
                     combined = pd.concat([self.cached_candles, df_today])
                     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
                     self.cached_candles = combined
+                    self.today_synced = True
                     return self.cached_candles
                 elif self.cached_candles is not None:
                     return self.cached_candles
             except Exception as e:
-                self.last_fetch_ts = now_ts
+                self.last_fetch_ts = time.time()
                 if self.cached_candles is not None:
+                    console.print(f"[yellow]Notice: Could not refresh today's candle bar yet ({e}). Will retry shortly.[/yellow]")
                     return self.cached_candles
                 console.print(f"[yellow]Angel One live feed fallback ({e}), checking Yahoo Finance...[/yellow]")
 
@@ -178,6 +230,24 @@ class LiveMarketRunner:
         except Exception:
             from data.synthetic import generate_realistic_nifty_intraday
             return generate_realistic_nifty_intraday(days=5, interval_mins=5)
+
+    def _is_contract_active(self, contract: str = "", strike: int = 0, option_type: str = "") -> bool:
+        """Checks whether a trade is already active in the same contract or (strike, option_type)."""
+        if contract and contract in self.active_trades:
+            return True
+        for t in self.active_trades.values():
+            if t.get("strike") == strike and t.get("option_type") == option_type:
+                return True
+        return False
+
+    def _manage_all_active_trades(self, current_bar: Optional[pd.Series] = None, live_spot: Optional[float] = None):
+        """Monitors all open contracts and removes any contract once its trade completes."""
+        for contract_key in list(self.active_trades.keys()):
+            trade = self.active_trades.get(contract_key)
+            if trade is not None:
+                exited = self._manage_live_position(trade, current_bar=current_bar, live_spot=live_spot)
+                if exited:
+                    self.active_trades.pop(contract_key, None)
 
     def evaluate_new_bar(self, df_ind: pd.DataFrame):
         """Processes the most recent completed 5-minute bar."""
@@ -192,11 +262,28 @@ class LiveMarketRunner:
             return # Already evaluated this bar
         self.last_candle_time = candle_time
 
-        console.print(f"[dim][{datetime.now().strftime('%H:%M:%S')}] New 5m Bar: ₹{latest_bar['Close']:,.1f} (VWAP: ₹{latest_bar['VWAP']:,.1f})[/dim]")
+        now_dt = datetime.now(candle_time.tzinfo) if getattr(candle_time, "tzinfo", None) is not None else datetime.now()
+        is_today_candle = candle_time.date() == now_dt.date()
+        is_fresh_candle = is_today_candle and abs((now_dt - candle_time).total_seconds()) <= 900
 
-        # 1. Manage active position if any
-        if self.active_trade is not None:
-            self._manage_live_position(latest_bar)
+        # Startup baseline sync: do NOT fire an immediate trade on the initial historical/startup bar
+        if not self.startup_synced:
+            self.startup_synced = True
+            console.print(
+                f"[cyan][Startup] Baseline synced to {candle_time.strftime('%Y-%m-%d %H:%M IST')} "
+                f"(Spot: ₹{latest_bar['Close']:,.1f}). Waiting for next live 5m bar before scanning signals...[/cyan]"
+            )
+            return
+
+        console.print(f"[dim][{datetime.now().strftime('%H:%M:%S')}] New 5m Bar ({candle_time.strftime('%H:%M')}): ₹{latest_bar['Close']:,.1f} (VWAP: ₹{latest_bar['VWAP']:,.1f})[/dim]")
+
+        # 1. Manage all currently active trades (only against fresh live bars)
+        if is_fresh_candle and self.active_trades:
+            self._manage_all_active_trades(current_bar=latest_bar)
+
+        # Guard against stale/non-today bars so an outdated candle never triggers an entry
+        if not is_fresh_candle:
+            console.print(f"[yellow]Skipping signal scan: candle {candle_time.strftime('%Y-%m-%d %H:%M')} is stale or not from today's live session.[/yellow]")
             return
 
         # 2. Check entry timing filter
@@ -210,9 +297,8 @@ class LiveMarketRunner:
             return
 
         # 4. Evaluate Technical + ML Confluence
-        spot_close = latest_bar['Close']
-        atr = latest_bar['ATR']
-        vwap = latest_bar['VWAP']
+        spot_close = float(latest_bar['Close'])
+        vwap = float(latest_bar['VWAP'])
         supertrend_dir = latest_bar['SuperTrend_Dir']
 
         pred = self.classifier.predict(latest_bar)
@@ -226,8 +312,33 @@ class LiveMarketRunner:
             signal = "BUY_PE"
 
         if signal:
+            # Verify live spot anchor so entry_spot/SL cannot diverge from real-time feed
+            entry_spot = spot_close
+            if isinstance(self.broker, AngelOneBroker) and self.broker.is_connected:
+                try:
+                    live_spot = self.broker.get_ltp("Nifty 50", "99926000", "NSE")
+                    if live_spot > 0:
+                        if abs(live_spot - spot_close) > 50.0:
+                            console.print(f"[yellow]Signal skipped: Bar close (₹{spot_close:.1f}) diverged from live spot (₹{live_spot:.1f}).[/yellow]")
+                            return
+                        entry_spot = float(live_spot)
+                except Exception:
+                    pass
+
+            option_type = "CE" if signal == "BUY_CE" else "PE"
+            candidate_strike = self.analyst.bs_engine.select_strike(
+                spot=entry_spot,
+                option_type=option_type,
+                selection_mode=STRATEGY.strike_selection,
+                strike_gap=MARKET.strike_gap
+            )
+            if self._is_contract_active(strike=candidate_strike, option_type=option_type):
+                console.print(f"[dim]Signal skipped: NIFTY {candidate_strike} {option_type} already has an active trade.[/dim]")
+                return
+
             candle_dict = latest_bar.to_dict()
-            candle_dict['time_str'] = candle_time.strftime("%H:%M IST")
+            candle_dict['Close'] = entry_spot
+            candle_dict['time_str'] = datetime.now().strftime("%H:%M IST")
             
             # Days to Thursday weekly expiry (calibrated for real trading-day DTE)
             days_to_thursday = (3 - datetime.now().weekday()) % 7
@@ -242,83 +353,101 @@ class LiveMarketRunner:
             )
 
             if advisory:
-                display_signal_card(advisory)
-                
+                if self._is_contract_active(
+                    contract=advisory['contract'],
+                    strike=advisory['strike'],
+                    option_type=advisory['option_type']
+                ):
+                    console.print(f"[dim]Signal skipped: {advisory['contract']} already has an active trade.[/dim]")
+                    return
+
                 # Check position sizing
                 pos_res = self.risk_manager.calculate_position_size(
                     entry_premium=advisory['entry_premium'],
                     risk_per_share=advisory['risk_per_share']
                 )
 
-                # Dispatch Telegram / WhatsApp alerts if configured
+                if self.auto_trade and not (pos_res.is_valid and pos_res.lots >= 1):
+                    console.print(f"[yellow]Auto-Trade skipped: {pos_res.rejection_reason}[/yellow]")
+                    return
+
                 lots = pos_res.lots if (pos_res.is_valid and pos_res.lots >= 1) else 1
                 qty = pos_res.quantity if (pos_res.is_valid and pos_res.lots >= 1) else MARKET.lot_size
+                if not pos_res.is_valid:
+                    console.print(f"[dim]Advisory note: {pos_res.rejection_reason}. Tracking 1-lot ({qty} Qty) advisory & SL/TP alerts.[/dim]")
+
+                display_signal_card(advisory)
+
+                # Dispatch Telegram / WhatsApp alerts if configured
                 tg_msg = format_telegram_alert(advisory, lots=lots, quantity=qty)
                 if send_telegram_alert(tg_msg):
                     console.print("[bold green]✓ Telegram Trade Alert dispatched.[/bold green]")
                 if send_whatsapp_alert(tg_msg):
                     console.print("[bold green]✓ WhatsApp Trade Alert dispatched.[/bold green]")
 
-                if pos_res.is_valid and pos_res.lots >= 1:
-                    # Record into persistent trade journal
-                    trade_payload = {
-                        "contract": advisory['contract'],
-                        "option_type": advisory['option_type'],
-                        "strike": advisory['strike'],
-                        "lots": pos_res.lots,
-                        "quantity": pos_res.quantity,
-                        "entry_time": datetime.now().strftime("%H:%M:%S"),
-                        "entry_premium": advisory['entry_premium'],
-                        "entry_spot": spot_close,
-                        "spot_sl": advisory['spot_sl'],
-                        "spot_target": advisory['spot_target'],
-                        "spot_target_2": advisory['spot_target_2'],
-                        "sl_premium": advisory['sl_premium'],
-                        "target_premium": advisory['target_premium'],
-                        "target_premium_2": advisory['target_premium_2'],
-                        "ai_confidence": advisory.get('ai_confidence', 'N/A')
-                    }
-                    journal_id = self.journal.record_entry(trade_payload)
+                # Always record into persistent trade journal & active tracker whenever an alert is sent
+                trade_payload = {
+                    "contract": advisory['contract'],
+                    "option_type": advisory['option_type'],
+                    "strike": advisory['strike'],
+                    "lots": lots,
+                    "quantity": qty,
+                    "entry_time": datetime.now().strftime("%H:%M:%S"),
+                    "entry_premium": advisory['entry_premium'],
+                    "entry_spot": entry_spot,
+                    "spot_sl": advisory['spot_sl'],
+                    "spot_target": advisory['spot_target'],
+                    "spot_target_2": advisory['spot_target_2'],
+                    "sl_premium": advisory['sl_premium'],
+                    "target_premium": advisory['target_premium'],
+                    "target_premium_2": advisory['target_premium_2'],
+                    "ai_confidence": advisory.get('ai_confidence', 'N/A')
+                }
+                journal_id = self.journal.record_entry(trade_payload)
 
-                    if self.auto_trade:
-                        console.print(f"[bold green]🚀 AUTO-TRADE TRIGGERED: Placing {pos_res.lots} Lots ({pos_res.quantity} Qty) on {advisory['contract']}...[/bold green]")
-                        res = self.broker.place_order(
-                            symbol=advisory['contract'],
-                            action="BUY",
-                            quantity=pos_res.quantity,
-                            price=advisory['entry_premium'],
-                            sl=advisory['sl_premium'],
-                            target=advisory['target_premium'],
-                            target_2=advisory['target_premium_2'],
-                            strike=advisory['strike'],
-                            option_type=advisory['option_type']
-                        )
-                        console.print(f"[bold green]✓ Order Executed: {res.message}[/bold green]")
-                        
-                    self.active_trade = {
-                        "journal_id": journal_id,
-                        "contract": advisory['contract'],
-                        "option_type": advisory['option_type'],
-                        "strike": advisory['strike'],
-                        "lots": pos_res.lots,
-                        "quantity": pos_res.quantity,
-                        "entry_spot": spot_close,
-                        "entry_premium": advisory['entry_premium'],
-                        "spot_sl": advisory['spot_sl'],
-                        "spot_target": advisory['spot_target'],
-                        "spot_target_2": advisory['spot_target_2'],
-                        "sl_premium": advisory['sl_premium'],
-                        "target_premium": advisory['target_premium'],
-                        "target_premium_2": advisory['target_premium_2'],
-                        "sl_trailed": False,
-                        "entry_time": datetime.now().strftime("%H:%M:%S")
-                    }
+                if self.auto_trade:
+                    console.print(f"[bold green]🚀 AUTO-TRADE TRIGGERED: Placing {lots} Lots ({qty} Qty) on {advisory['contract']}...[/bold green]")
+                    res = self.broker.place_order(
+                        symbol=advisory['contract'],
+                        action="BUY",
+                        quantity=qty,
+                        price=advisory['entry_premium'],
+                        sl=advisory['sl_premium'],
+                        target=advisory['target_premium'],
+                        target_2=advisory['target_premium_2'],
+                        strike=advisory['strike'],
+                        option_type=advisory['option_type']
+                    )
+                    console.print(f"[bold green]✓ Order Executed: {res.message}[/bold green]")
 
-    def _manage_live_position(self, current_bar: Optional[pd.Series] = None, live_spot: Optional[float] = None):
-        """Monitors live active trade against SL, Target 1, Target 2, and 15:15 IST cutoff."""
-        trade = self.active_trade
+                self.active_trades[advisory['contract']] = {
+                    "journal_id": journal_id,
+                    "contract": advisory['contract'],
+                    "option_type": advisory['option_type'],
+                    "strike": advisory['strike'],
+                    "lots": lots,
+                    "quantity": qty,
+                    "entry_spot": entry_spot,
+                    "entry_premium": advisory['entry_premium'],
+                    "spot_sl": advisory['spot_sl'],
+                    "spot_target": advisory['spot_target'],
+                    "spot_target_2": advisory['spot_target_2'],
+                    "sl_premium": advisory['sl_premium'],
+                    "target_premium": advisory['target_premium'],
+                    "target_premium_2": advisory['target_premium_2'],
+                    "sl_trailed": False,
+                    "entry_time": datetime.now().strftime("%H:%M:%S")
+                }
+
+    def _manage_live_position(
+        self,
+        trade: Dict[str, Any],
+        current_bar: Optional[pd.Series] = None,
+        live_spot: Optional[float] = None
+    ) -> bool:
+        """Monitors an active trade against SL, Target 1, Target 2, and 15:15 IST cutoff. Returns True if exited."""
         if trade is None:
-            return
+            return False
 
         if current_bar is not None:
             spot = current_bar['Close']
@@ -329,7 +458,7 @@ class LiveMarketRunner:
             high = live_spot
             low = live_spot
         else:
-            return
+            return False
 
         is_ce = trade['option_type'] == "CE"
 
@@ -395,17 +524,24 @@ class LiveMarketRunner:
 
         # Execute Exit if triggered
         if exit_triggered:
-            console.print(f"[bold red]🔔 EXIT TRIGGERED: {exit_reason}[/bold red]")
-            exit_premium_used = trade['target_premium_2'] if "Target 2" in exit_reason else trade['sl_premium']
+            console.print(f"[bold red]🔔 EXIT TRIGGERED ({trade['contract']}): {exit_reason}[/bold red]")
+            if "Target 2" in exit_reason:
+                exit_premium_used = trade['target_premium_2']
+            elif trade.get('sl_trailed') and "Stop Loss" in exit_reason:
+                exit_premium_used = trade['entry_premium']
+            elif "Square-off" in exit_reason:
+                exit_premium_used = trade['entry_premium']
+            else:
+                exit_premium_used = trade['sl_premium']
             if trade.get('journal_id'):
                 self.journal.record_exit(trade['journal_id'], exit_premium_used, exit_reason)
             if self.auto_trade:
-                res = self.broker.place_order(trade['contract'], "SELL", trade['quantity'], price=trade['sl_premium'])
+                res = self.broker.place_order(trade['contract'], "SELL", trade['quantity'], price=exit_premium_used)
                 console.print(f"[yellow]{res.message}[/yellow]")
             if exit_alert_msg:
                 send_telegram_alert(exit_alert_msg)
                 send_whatsapp_alert(exit_alert_msg)
-            self.active_trade = None
+        return exit_triggered
 
     def send_and_save_eod_summary(self) -> str:
         """Generates, prints, persists to disk, and sends the EOD summary report to Telegram."""
@@ -453,11 +589,11 @@ class LiveMarketRunner:
                     self.eod_report_sent = True
 
                 # Real-time position tracking between 5m bars using lightweight LTP
-                if self.active_trade is not None and isinstance(self.broker, AngelOneBroker) and self.broker.is_connected:
+                if self.active_trades and isinstance(self.broker, AngelOneBroker) and self.broker.is_connected:
                     try:
                         spot_ltp = self.broker.get_ltp("Nifty 50", "99926000", "NSE")
                         if spot_ltp > 0:
-                            self._manage_live_position(live_spot=spot_ltp)
+                            self._manage_all_active_trades(live_spot=spot_ltp)
                     except Exception:
                         pass
 

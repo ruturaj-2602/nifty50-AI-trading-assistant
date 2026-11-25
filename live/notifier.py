@@ -20,9 +20,9 @@ def format_telegram_alert(advisory: Dict[str, Any], lots: int = 1, quantity: int
     
     confluences = "\n".join([f"  • {c}" for c in advisory.get('confluences', [])])
     
-    sl_pts = max(advisory['entry_premium'] - advisory['sl_premium'], 15.0)
-    target_pts = max(advisory['target_premium'] - advisory['entry_premium'], 20.0)
-    target2_pts = max(advisory['target_premium_2'] - advisory['entry_premium'], 30.0)
+    sl_pts = max(advisory['entry_premium'] - advisory['sl_premium'], 1.0)
+    target_pts = max(advisory['target_premium'] - advisory['entry_premium'], 1.0)
+    target2_pts = max(advisory['target_premium_2'] - advisory['entry_premium'], 1.0)
     
     msg = f"""
 ⚡ *NIFTY INTRADAY AI TRADE ALERT* ⚡

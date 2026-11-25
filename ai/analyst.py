@@ -47,69 +47,61 @@ class AIAnalyst:
             strike_gap=MARKET.strike_gap
         )
         
-        # Dynamic ATR-based Stop Loss & Target in Spot Points
-        sl_points = round(max(atr * 1.2, 25.0), 1)  # Minimum 25 points SL on Nifty
-        target_points = round(sl_points * STRATEGY.min_risk_reward, 1)
-        
+        # Calculate initial Greeks to get Option Delta for spot <-> premium mapping
+        entry_greeks = self.bs_engine.calculate_greeks(spot_close, strike, dte_days, iv, option_type)
+        delta = max(abs(entry_greeks.delta), 0.35)
+
+        # Dynamic ATR-based Stop Loss in Spot Points (absorbs normal 5m candle wicks)
+        sl_points = round(max(atr * 1.2, 25.0), 1)
+        sl_opt_pts = round(sl_points * delta, 1)
+
+        # Confidence-driven Option Premium Targets (in option points):
+        # - Standard confidence (< 78%): T1 = 16 to 24 pts, T2 = 26 to 30 pts (lock profit before reversal)
+        # - Full confidence (>= 78%): T1 = 22 to 24 pts (trail SL to cost), T2 = 50 pts runner
+        if confidence >= 0.78:
+            target1_opt_pts = 24.0 if confidence >= 0.85 else 22.0
+            target2_opt_pts = 50.0
+        else:
+            conf_span = max(0.78 - STRATEGY.ml_confidence_threshold, 0.01)
+            conf_factor = min(max((confidence - STRATEGY.ml_confidence_threshold) / conf_span, 0.0), 1.0)
+            target1_opt_pts = round(16.0 + conf_factor * 8.0, 1)   # Strictly 16.0 - 24.0 pts
+            target2_opt_pts = round(26.0 + conf_factor * 4.0, 1)   # Strictly 26.0 - 30.0 pts
+
+        # Convert Option Point targets into NIFTY Spot Points via Delta
+        target_points = round(target1_opt_pts / delta, 1)
+        target_points_2 = round(target2_opt_pts / delta, 1)
+
         if option_type == "CE":
             spot_sl = spot_close - sl_points
             spot_target = spot_close + target_points
-            spot_target_2 = spot_close + (target_points * 1.4)
+            spot_target_2 = spot_close + target_points_2
         else:
             spot_sl = spot_close + sl_points
             spot_target = spot_close - target_points
-            spot_target_2 = spot_close - (target_points * 1.4)
-            
-        # Map to Option Premium Levels via Black-Scholes
-        opt_levels = self.bs_engine.map_spot_to_option_levels(
-            spot_entry=spot_close,
-            spot_sl=spot_sl,
-            spot_target=spot_target,
-            strike=strike,
-            option_type=option_type,
-            dte_days=dte_days,
-            iv=iv
-        )
-        
-        entry_prem = opt_levels['entry_premium']
-        sl_prem = opt_levels['sl_premium']
-        target_prem = opt_levels['target_premium']
-        
-        # Second target option premium
-        opt_levels_t2 = self.bs_engine.map_spot_to_option_levels(
-            spot_entry=spot_close,
-            spot_sl=spot_sl,
-            spot_target=spot_target_2,
-            strike=strike,
-            option_type=option_type,
-            dte_days=dte_days,
-            iv=iv
-        )
-        
+            spot_target_2 = spot_close - target_points_2
+
         # Check for Real Exchange Quote from Angel One
         from core.option_resolver import RESOLVER
         real_symbol, real_token, real_ltp = RESOLVER.get_real_option_quote(strike, option_type, broker=broker)
-        
-        delta = abs(opt_levels['delta'])
+
         contract_name = real_symbol if real_symbol else f"NIFTY {strike} {option_type}"
-        
+
         if real_ltp > 0:
             # LIVE REAL-TIME EXCHANGE QUOTES
             entry_prem = round(real_ltp, 1)
-            sl_prem = round(max(real_ltp - (sl_points * delta), 2.0), 1)
-            target_prem = round(real_ltp + (target_points * delta), 1)
-            target_prem_2 = round(real_ltp + (target_points * 1.4 * delta), 1)
             is_live_quote = True
         else:
-            entry_prem = opt_levels['entry_premium']
-            sl_prem = opt_levels['sl_premium']
-            target_prem = opt_levels['target_premium']
-            target_prem_2 = opt_levels_t2['target_premium']
+            entry_prem = round(entry_greeks.price, 1)
             is_live_quote = False
-        
+
+        sl_prem = round(max(entry_prem - sl_opt_pts, 2.0), 1)
+        target_prem = round(entry_prem + target1_opt_pts, 1)
+        target_prem_2 = round(entry_prem + target2_opt_pts, 1)
+
         risk_per_share = max(entry_prem - sl_prem, 2.0)
         gain_per_share = max(target_prem - entry_prem, 3.0)
-        
+        rr_ratio = round(gain_per_share / risk_per_share, 2)
+
         risk_per_lot = risk_per_share * MARKET.lot_size
         gain_per_lot = gain_per_share * MARKET.lot_size
         gain_per_lot_2 = max(target_prem_2 - entry_prem, 0) * MARKET.lot_size
@@ -160,13 +152,13 @@ class AIAnalyst:
             "target_premium_2": target_prem_2,
             "risk_per_share": round(risk_per_share, 2),
             "gain_per_share": round(gain_per_share, 2),
-            "risk_reward_ratio": f"1:{opt_levels['risk_reward_ratio']}",
+            "risk_reward_ratio": f"1:{rr_ratio}",
             "lot_size": MARKET.lot_size,
             "risk_per_lot": round(risk_per_lot, 2),
             "gain_per_lot": round(gain_per_lot, 2),
             "gain_per_lot_2": round(gain_per_lot_2, 2),
-            "delta": opt_levels['delta'],
-            "theta_daily": opt_levels['theta'],
+            "delta": round(entry_greeks.delta, 3),
+            "theta_daily": round(entry_greeks.theta, 2),
             "ai_confidence": f"{confidence * 100:.1f}%",
             "confluences": confluences,
             "management_plan": [
