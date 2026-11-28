@@ -24,6 +24,7 @@ from live.notifier import (
     format_telegram_alert,
     format_target1_alert,
     format_target2_alert,
+    format_target2_info_alert,
     format_stoploss_alert,
     format_time_squareoff_alert,
     send_telegram_alert,
@@ -64,10 +65,12 @@ class LiveMarketRunner:
             self.classifier.train(df)
 
         self.active_trades: Dict[str, Dict[str, Any]] = {}
+        self.shadow_targets: Dict[str, Dict[str, Any]] = {}
         self.last_candle_time = None
         self.startup_synced = False
         self.cached_candles = None
         self.last_fetch_ts = 0.0
+        self.next_bar_close_ts = 0.0
         self.today_synced = False
         from core.trade_journal import TradeJournal
         self.journal = TradeJournal()
@@ -137,7 +140,8 @@ class LiveMarketRunner:
                     last_dt = pd.to_datetime(self.last_candle_time)
                     if hasattr(last_dt, 'tz_localize') and last_dt.tzinfo is None:
                         last_dt = last_dt.tz_localize("Asia/Kolkata")
-                    next_bar_ts = last_dt.timestamp() + 300 + 5 # 5 mins + 5s buffer
+                    # last_candle_time is the last CLOSED bar; next bar closes 10m + 5s after last_dt's open
+                    next_bar_ts = max(self.next_bar_close_ts, last_dt.timestamp() + 605)
                     if now_ts < next_bar_ts:
                         return self.cached_candles
                 except Exception:
@@ -241,13 +245,36 @@ class LiveMarketRunner:
         return False
 
     def _manage_all_active_trades(self, current_bar: Optional[pd.Series] = None, live_spot: Optional[float] = None):
-        """Monitors all open contracts and removes any contract once its trade completes."""
+        """Monitors all open contracts and informational Target-2 shadow trackers."""
         for contract_key in list(self.active_trades.keys()):
             trade = self.active_trades.get(contract_key)
             if trade is not None:
                 exited = self._manage_live_position(trade, current_bar=current_bar, live_spot=live_spot)
                 if exited:
                     self.active_trades.pop(contract_key, None)
+
+        # Check closed trades watching for informational Target 2 milestone
+        if self.shadow_targets:
+            if current_bar is not None:
+                high, low = current_bar['High'], current_bar['Low']
+            elif live_spot is not None:
+                high = low = live_spot
+            else:
+                return
+            for contract_key in list(self.shadow_targets.keys()):
+                st = self.shadow_targets[contract_key]
+                is_ce = st['option_type'] == "CE"
+                if self.is_square_off_time() or (is_ce and low <= st['entry_spot']) or (not is_ce and high >= st['entry_spot']):
+                    self.shadow_targets.pop(contract_key, None)
+                elif (is_ce and high >= st['spot_target_2']) or (not is_ce and low <= st['spot_target_2']):
+                    console.print(f"[bold cyan]📣 Target 2 Info Hit ({contract_key}): ₹{st['target_premium_2']:.1f}[/bold cyan]")
+                    t2_info = format_target2_info_alert(
+                        contract=contract_key,
+                        entry_premium=st['entry_premium'],
+                        target_premium_2=st['target_premium_2']
+                    )
+                    send_telegram_alert(t2_info)
+                    self.shadow_targets.pop(contract_key, None)
 
     def evaluate_new_bar(self, df_ind: pd.DataFrame):
         """Processes the most recent completed 5-minute bar."""
@@ -257,12 +284,21 @@ class LiveMarketRunner:
 
         latest_bar = df_feat.iloc[-1]
         candle_time = df_feat.index[-1]
+        now_dt = datetime.now(candle_time.tzinfo) if getattr(candle_time, "tzinfo", None) is not None else datetime.now()
+
+        # Never trigger signals on an unclosed, still-forming 5m bar:
+        # If the trailing bar is < 295s old today, evaluate the most recently COMPLETED bar (iloc[-2]) instead.
+        if candle_time.date() == now_dt.date() and 0 <= (now_dt - candle_time).total_seconds() < 295 and len(df_feat) >= 2:
+            self.next_bar_close_ts = candle_time.timestamp() + 305
+            latest_bar = df_feat.iloc[-2]
+            candle_time = df_feat.index[-2]
+        else:
+            self.next_bar_close_ts = candle_time.timestamp() + 605
 
         if candle_time == self.last_candle_time:
             return # Already evaluated this bar
         self.last_candle_time = candle_time
 
-        now_dt = datetime.now(candle_time.tzinfo) if getattr(candle_time, "tzinfo", None) is not None else datetime.now()
         is_today_candle = candle_time.date() == now_dt.date()
         is_fresh_candle = is_today_candle and abs((now_dt - candle_time).total_seconds()) <= 900
 
@@ -277,8 +313,8 @@ class LiveMarketRunner:
 
         console.print(f"[dim][{datetime.now().strftime('%H:%M:%S')}] New 5m Bar ({candle_time.strftime('%H:%M')}): ₹{latest_bar['Close']:,.1f} (VWAP: ₹{latest_bar['VWAP']:,.1f})[/dim]")
 
-        # 1. Manage all currently active trades (only against fresh live bars)
-        if is_fresh_candle and self.active_trades:
+        # 1. Manage all currently active trades & Target-2 info trackers (only against fresh live bars)
+        if is_fresh_candle and (self.active_trades or self.shadow_targets):
             self._manage_all_active_trades(current_bar=latest_bar)
 
         # Guard against stale/non-today bars so an outdated candle never triggers an entry
@@ -492,41 +528,33 @@ class LiveMarketRunner:
                 was_trailed=was_trailed
             )
 
-        # 3. Target 2 Runner Check
-        elif (is_ce and high >= trade['spot_target_2']) or (not is_ce and low <= trade['spot_target_2']):
+        # 3. Target 1 Check — Single-lot mode books 100% profit & closes position immediately
+        elif (is_ce and high >= trade['spot_target']) or (not is_ce and low <= trade['spot_target']):
             exit_triggered = True
-            exit_reason = f"Target 2 Full Hit (Spot {trade['spot_target_2']:.1f})"
-            exit_alert_msg = format_target2_alert(
+            exit_reason = f"Target 1 Hit (Full Profit Booked @ Spot {trade['spot_target']:.1f})"
+            exit_alert_msg = format_target1_alert(
                 contract=trade['contract'],
                 entry_premium=trade['entry_premium'],
-                target_premium_2=trade['target_premium_2'],
+                target_premium=trade['target_premium'],
                 lots=trade['lots'],
                 quantity=trade['quantity']
             )
-
-        # 4. Target 1: Trail Stop Loss to Entry Cost
-        elif not trade['sl_trailed']:
-            if (is_ce and high >= trade['spot_target']) or (not is_ce and low <= trade['spot_target']):
-                trade['spot_sl'] = trade['entry_spot'] # Trail to breakeven
-                trade['sl_trailed'] = True
-                if trade.get('journal_id'):
-                    self.journal.record_target1(trade['journal_id'], trade['target_premium'])
-                console.print(f"[bold cyan]🎯 Target 1 Reached! Stop-loss trailed to Breakeven (Spot: ₹{trade['entry_spot']:.1f})[/bold cyan]")
-                t1_msg = format_target1_alert(
-                    contract=trade['contract'],
-                    entry_premium=trade['entry_premium'],
-                    target_premium=trade['target_premium'],
-                    lots=trade['lots'],
-                    quantity=trade['quantity']
-                )
-                send_telegram_alert(t1_msg)
-                send_whatsapp_alert(t1_msg)
+            # Keep lightweight shadow watch so user still gets an FYI alert if Target 2 hits
+            self.shadow_targets[trade['contract']] = {
+                "option_type": trade['option_type'],
+                "entry_spot": trade['entry_spot'],
+                "spot_target_2": trade['spot_target_2'],
+                "entry_premium": trade['entry_premium'],
+                "target_premium_2": trade['target_premium_2']
+            }
 
         # Execute Exit if triggered
         if exit_triggered:
             console.print(f"[bold red]🔔 EXIT TRIGGERED ({trade['contract']}): {exit_reason}[/bold red]")
             if "Target 2" in exit_reason:
                 exit_premium_used = trade['target_premium_2']
+            elif "Target 1" in exit_reason:
+                exit_premium_used = trade['target_premium']
             elif trade.get('sl_trailed') and "Stop Loss" in exit_reason:
                 exit_premium_used = trade['entry_premium']
             elif "Square-off" in exit_reason:
@@ -588,8 +616,8 @@ class LiveMarketRunner:
                     self.send_and_save_eod_summary()
                     self.eod_report_sent = True
 
-                # Real-time position tracking between 5m bars using lightweight LTP
-                if self.active_trades and isinstance(self.broker, AngelOneBroker) and self.broker.is_connected:
+                # Real-time position & Target-2 info tracking between 5m bars using lightweight LTP
+                if (self.active_trades or self.shadow_targets) and isinstance(self.broker, AngelOneBroker) and self.broker.is_connected:
                     try:
                         spot_ltp = self.broker.get_ltp("Nifty 50", "99926000", "NSE")
                         if spot_ltp > 0:

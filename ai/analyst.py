@@ -51,21 +51,20 @@ class AIAnalyst:
         entry_greeks = self.bs_engine.calculate_greeks(spot_close, strike, dte_days, iv, option_type)
         delta = max(abs(entry_greeks.delta), 0.35)
 
-        # Dynamic ATR-based Stop Loss in Spot Points (absorbs normal 5m candle wicks)
-        sl_points = round(max(atr * 1.2, 25.0), 1)
+        # Dynamic ATR-based Stop Loss in Spot Points (capped at 38 pts so 1 SL never exceeds 1 T2 win)
+        sl_points = round(min(max(atr * 1.0, 26.0), 38.0), 1)
         sl_opt_pts = round(sl_points * delta, 1)
 
         # Confidence-driven Option Premium Targets (in option points):
-        # - Standard confidence (< 78%): T1 = 16 to 24 pts, T2 = 26 to 30 pts (lock profit before reversal)
+        # - Standard confidence (< 78%): T1 = 18 to 24 pts (trail SL to cost), T2 = 30 to 36 pts (positive R:R)
         # - Full confidence (>= 78%): T1 = 22 to 24 pts (trail SL to cost), T2 = 50 pts runner
         if confidence >= 0.78:
             target1_opt_pts = 24.0 if confidence >= 0.85 else 22.0
             target2_opt_pts = 50.0
         else:
-            conf_span = max(0.78 - STRATEGY.ml_confidence_threshold, 0.01)
-            conf_factor = min(max((confidence - STRATEGY.ml_confidence_threshold) / conf_span, 0.0), 1.0)
-            target1_opt_pts = round(16.0 + conf_factor * 8.0, 1)   # Strictly 16.0 - 24.0 pts
-            target2_opt_pts = round(26.0 + conf_factor * 4.0, 1)   # Strictly 26.0 - 30.0 pts
+            conf_factor = min(max((confidence - 0.50) / 0.28, 0.0), 1.0)
+            target1_opt_pts = round(18.0 + conf_factor * 6.0, 1)   # 18.0 - 24.0 pts (~22.3+ pts at >=70%)
+            target2_opt_pts = round(30.0 + conf_factor * 6.0, 1)   # 30.0 - 36.0 pts
 
         # Convert Option Point targets into NIFTY Spot Points via Delta
         target_points = round(target1_opt_pts / delta, 1)
@@ -164,9 +163,8 @@ class AIAnalyst:
             "management_plan": [
                 f"Entry: Buy at ₹{entry_prem:.1f} (Option) / {spot_close:.1f} (Spot)",
                 f"Stop Loss: Hard Stop at ₹{sl_prem:.1f} (Max loss ₹{risk_per_lot:.0f}/lot)",
-                f"Target 1: Book 50% lots at ₹{target_prem:.1f} (+₹{gain_per_lot:.0f}/lot)",
-                f"Target 2: Trail remaining lots to ₹{target_prem_2:.1f} (+₹{gain_per_lot_2:.0f}/lot)",
-                f"Trailing Rule: Move Stop Loss to Cost (₹{entry_prem:.1f}) once Target 1 is hit",
+                f"Target 1 (Exit 100%): Book FULL 1 Lot profit at ₹{target_prem:.1f} (+₹{gain_per_lot:.0f}/lot)",
+                f"Target 2 (Info Only): ₹{target_prem_2:.1f} (+₹{gain_per_lot_2:.0f}/lot — alert sent if reached)",
                 "Mandatory Exit: Close all open intraday positions before 15:15 IST"
             ]
         }

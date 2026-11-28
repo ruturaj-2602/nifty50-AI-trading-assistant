@@ -35,8 +35,8 @@ def format_telegram_alert(advisory: Dict[str, Any], lots: int = 1, quantity: int
 💰 *EXECUTION LEVELS (OPTION PREMIUM):*
 • *Action:* BUY AT CURRENT MARKET PRICE (CMP ~₹{advisory['entry_premium']:.1f})
 • *Stop Loss:* Entry - {sl_pts:.1f} pts  [~₹{advisory['sl_premium']:.1f}]  *(Spot: {advisory['spot_sl']:.0f})*
-• *Target 1 (50%):* Entry + {target_pts:.1f} pts  [~₹{advisory['target_premium']:.1f}]  *(Spot: {advisory['spot_target']:.0f})*
-• *Target 2 (Runner):* Entry + {target2_pts:.1f} pts  [~₹{advisory['target_premium_2']:.1f}]  *(Spot: {advisory['spot_target_2']:.0f})*
+• *Target 1 (Exit 100%):* Entry + {target_pts:.1f} pts  [~₹{advisory['target_premium']:.1f}]  *(Spot: {advisory['spot_target']:.0f})*
+• *Target 2 (Info Alert):* Entry + {target2_pts:.1f} pts  [~₹{advisory['target_premium_2']:.1f}]  *(Spot: {advisory['spot_target_2']:.0f})*
 • *Risk : Reward:* {advisory['risk_reward_ratio']}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 💼 *CAPITAL & POSITION SIZING:*
@@ -51,28 +51,42 @@ def format_telegram_alert(advisory: Dict[str, Any], lots: int = 1, quantity: int
 ⚠️ *TRADE MANAGEMENT RULES:*
 1. *Enter IMMEDIATELY at Market Price (CMP).* Do not wait for any higher price.
 2. Place Stop Loss ~{sl_pts:.0f} pts below your actual buy price.
-3. Once Target 1 (+{target_pts:.0f} pts) is hit, *trail SL to Cost*.
-4. Auto square-off if not exited before *15:15 IST*.
+3. *Exit FULL 1 Lot when Target 1 (+{target_pts:.0f} pts) hits* — do not keep any lot pending.
+4. Target 2 is tracked for info only (you will get an alert if it hits).
+5. Auto square-off if not exited before *15:15 IST*.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     return msg.strip()
 
 def format_target1_alert(contract: str, entry_premium: float, target_premium: float, lots: int = 1, quantity: int = 65) -> str:
-    """Alert triggered when Target 1 is achieved and SL moves to breakeven."""
+    """Alert triggered when Target 1 is achieved — closes full single lot position."""
     gain_pts = max(target_premium - entry_premium, 0.0)
-    gain_booked = (gain_pts * quantity) * 0.5  # 50% booked
+    gain_booked = gain_pts * quantity  # 100% single lot booked
     return f"""
-🎯 *TARGET 1 HIT — PROFIT BOOKING ALERT* 🎯
+🎯 *TARGET 1 HIT — FULL PROFIT BOOKED* 🎯
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 📌 *Contract:* `{contract}`
 💰 *Entry Price:* ₹{entry_premium:.1f}
 🚀 *Target 1 Hit:* ₹{target_premium:.1f} (+{gain_pts:.1f} pts)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
-🔒 *ACTIONS TO TAKE NOW:*
-1. *Book 50% lots* (+₹{gain_booked:,.0f} profit secured)
-2. *Move Stop Loss to Cost: ₹{entry_premium:.1f}*
-✨ *Trade is now 100% Risk-Free!*
-🏃 *Let remaining lots run toward Target 2.*
+🏆 *TRADE COMPLETED (100% EXITED):*
+• *Profit Booked ({lots} Lot / {quantity} Qty):* *+₹{gain_booked:,.2f}*
+• *Position Status:* Closed (no lot left pending).
+• *Note:* We will still notify you if Target 2 is reached!
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+""".strip()
+
+def format_target2_info_alert(contract: str, entry_premium: float, target_premium_2: float) -> str:
+    """Informational alert when Target 2 is also reached after Target 1 already booked the single lot."""
+    gain_pts = max(target_premium_2 - entry_premium, 0.0)
+    return f"""
+📣 *TARGET 2 HIT (INFO ONLY) — BONUS MOVE CONFIRMED* 📣
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+📌 *Contract:* `{contract}`
+💰 *Entry Price:* ₹{entry_premium:.1f}
+🎯 *Target 2 Reached:* ₹{target_premium_2:.1f} (+{gain_pts:.1f} pts)
+━━━━━━━━━━━━━━━━━━━━━━━━━━
+ℹ️ *Note:* Your 1 lot was already booked safely at Target 1. Sharing this update so you know Target 2 was also hit!
 ━━━━━━━━━━━━━━━━━━━━━━━━━━
 """.strip()
 
@@ -227,24 +241,30 @@ def format_exit_alert(contract: str, reason: str, exit_price: float, pnl: float)
 
 def send_telegram_alert(message: str) -> bool:
     """
-    Sends message to Telegram via Bot API if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are set in .env.
+    Sends message to Telegram via Bot API with automatic retries so alerts are never dropped.
     """
+    import time
     token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
         return False
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {
-            "chat_id": chat_id,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-        res = requests.post(url, json=payload, timeout=5)
-        return res.status_code == 200
-    except Exception as e:
-        print(f"[Notifier] Telegram dispatch error: {e}")
-        return False
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": message,
+        "parse_mode": "Markdown"
+    }
+    for attempt in range(3):
+        try:
+            res = requests.post(url, json=payload, timeout=10)
+            if res.status_code == 200:
+                return True
+            print(f"[Notifier] Telegram HTTP {res.status_code} (attempt {attempt + 1}/3): {res.text[:150]}")
+        except Exception as e:
+            print(f"[Notifier] Telegram dispatch error (attempt {attempt + 1}/3): {e}")
+        if attempt < 2:
+            time.sleep(1.0)
+    return False
 
 def send_whatsapp_alert(message: str) -> bool:
     """

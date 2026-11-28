@@ -23,8 +23,8 @@ class TripleBarrierLabeler:
     def generate_labels(
         df: pd.DataFrame,
         sl_atr_mult: float = 1.0,
-        tp_atr_mult: float = 1.5,
-        max_horizon_bars: int = 35
+        tp_atr_mult: float = 1.2,
+        max_horizon_bars: int = 24
     ) -> Tuple[pd.Series, pd.Series]:
         """
         Returns (bullish_labels, bearish_labels).
@@ -83,19 +83,19 @@ class IntradaySignalClassifier:
     """
     AI model that scores real-time intraday setups and filters false breakouts.
     """
-    def __init__(self, confidence_threshold: float = 0.50):
+    def __init__(self, confidence_threshold: float = 0.70):
         self.confidence_threshold = confidence_threshold
         self.bull_model = None
         self.bear_model = None
         self.is_trained = False
         self.feature_names = FEATURE_COLUMNS
 
-    def train(self, df: pd.DataFrame, sl_atr_mult: float = 1.0, tp_atr_mult: float = 1.5):
+    def train(self, df: pd.DataFrame, sl_atr_mult: float = 1.0, tp_atr_mult: float = 1.2):
         """
         Trains bullish and bearish directional classifiers using walk-forward data.
         """
         df_feat = engineer_features(df).dropna(subset=FEATURE_COLUMNS)
-        bull_labels, bear_labels = TripleBarrierLabeler.generate_labels(df_feat, sl_atr_mult, tp_atr_mult)
+        bull_labels, bear_labels = TripleBarrierLabeler.generate_labels(df_feat, sl_atr_mult, tp_atr_mult, max_horizon_bars=24)
         
         valid_mask = bull_labels.notna() & bear_labels.notna()
         X = df_feat.loc[valid_mask, FEATURE_COLUMNS].values
@@ -110,20 +110,20 @@ class IntradaySignalClassifier:
         
         # Train Bullish Classifier
         self.bull_model = HistGradientBoostingClassifier(
-            max_iter=100,
+            max_iter=150,
             learning_rate=0.03,
-            max_leaf_nodes=31,
-            min_samples_leaf=15,
+            max_leaf_nodes=25,
+            min_samples_leaf=20,
             random_state=42
         )
         self.bull_model.fit(X_train, y_bull_train)
         
         # Train Bearish Classifier
         self.bear_model = HistGradientBoostingClassifier(
-            max_iter=100,
+            max_iter=150,
             learning_rate=0.03,
-            max_leaf_nodes=31,
-            min_samples_leaf=15,
+            max_leaf_nodes=25,
+            min_samples_leaf=20,
             random_state=42
         )
         self.bear_model.fit(X_train, y_bear_train)

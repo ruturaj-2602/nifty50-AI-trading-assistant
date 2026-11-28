@@ -57,7 +57,7 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     
     # 6. Bollinger Bands
     bb_width_diff = (df['BB_Upper'] - df['BB_Lower']).replace(0, np.nan)
-    df['bb_pct_b'] = (df['Close'] - df['Lower_Wick']) / bb_width_diff
+    df['bb_pct_b'] = (df['Close'] - df['BB_Lower']) / bb_width_diff
     df['bb_bandwidth'] = df['BB_Bandwidth']
     
     # 7. Candlestick Anatomy

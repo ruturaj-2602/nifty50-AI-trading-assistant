@@ -62,7 +62,7 @@ class StrategyConfig:
     orb_minutes: int = 15              # Opening range breakout duration
 
     # Machine Learning Signals
-    ml_confidence_threshold: float = 0.50  # Minimum probability for signal execution
+    ml_confidence_threshold: float = 0.70  # High-conviction threshold (~3.9 trades/day, 1.55 PF)
     min_risk_reward: float = 1.35          # Target 1.35 R:R for higher win rate
     
     # Options specifics
